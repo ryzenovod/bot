@@ -1,226 +1,130 @@
+"""Telegram bot entrypoint for collecting automotive leads."""
+from __future__ import annotations
+
 import asyncio
 import logging
-import os
-import json
 from datetime import datetime
+from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart, Command
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    ReplyKeyboardRemove,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
+
+from config import Settings
+from keyboards import SERVICE_OPTIONS, service_inline_keyboard
+from leads import format_lead_summary, format_leads_for_admin, load_last_leads, save_lead_to_file
+from states import LeadForm
+
+settings = Settings.load()
 
 
-# === Настройки ===
+DETAIL_QUESTIONS = {
+    SERVICE_OPTIONS[0]: (
+        "Опишите, что ищем: <b>марка/модель</b> или класс авто, <b>год</b>,\n"
+        "<b>ориентировочный бюджет</b> и приоритеты (надёжность, комфорт, свежий год и т.п.)."
+    ),
+    SERVICE_OPTIONS[1]: (
+        "Расскажите о машине (марка/модель/год) и что доработать: <b>диски</b>, <b>обвес</b>,"
+        " <b>оптика</b>, <b>салон</b>, техника, ориентировочный бюджет и сроки."
+    ),
+    SERVICE_OPTIONS[2]: (
+        "Укажите авто (марка/модель/год) и что нужно: резина (лето/зима/всесезон),"
+        " колодки, фильтры и т.п. Нужна установка или только поставка?"
+    ),
+    SERVICE_OPTIONS[3]: (
+        "Опишите авто (марка/модель/цвет/год) и задачи: мойка, химчистка, полировка,"
+        " защитные покрытия, подготовка к продаже. Когда желательно выполнить?"
+    ),
+    SERVICE_OPTIONS[4]: "Напишите ваш вопрос или ситуацию в свободной форме, мы подскажем, как лучше поступить.",
+}
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("Не найден BOT_TOKEN в переменных окружения")
+GREETING_TEXT = (
+    "<b>Привет!</b> Я помогу оформить заявку на: \n"
+    "• привоз авто из Азии под ключ 🚗\n"
+    "• тюнинг и доработку 🛠\n"
+    "• резину и расходники 🛞\n"
+    "• детейлинг и подготовку ✨\n\n"
+    "Выберите подходящую услугу кнопкой ниже. Это займёт 1–2 минуты, и мы сразу приступим к расчёту."
+)
 
-# ID админа (куда слать заявки и кому разрешён /leads)
-ADMIN_CHAT_ID_RAW = os.getenv("ADMIN_CHAT_ID", "0")
-try:
-    ADMIN_CHAT_ID = int(ADMIN_CHAT_ID_RAW)
-except ValueError:
-    ADMIN_CHAT_ID = 0
+SERVICE_CONFIRMED_TEXT = (
+    "Отлично, фиксирую услугу: <b>{service}</b>.\n"
+    "Сейчас спрошу пару деталей, чтобы передать вашу задачу специалисту.\n\n"
+    "Как к вам обращаться?"
+)
 
-# файл, куда будут складываться все заявки (по одной JSON-строке)
-LEADS_FILE = "leads.jsonl"
-
-# варианты услуг (тексты кнопок)
-SERVICE_OPTIONS = [
-    "Привезти авто под заказ",
-    "Тюнинг / доработка авто",
-    "Резина и расходники",
-    "Детейлинг / подготовка авто",
-    "Просто консультация",
-]
-
-
-# === FSM-состояния ===
-
-class LeadForm(StatesGroup):
-    choosing_service = State()
-    getting_name = State()
-    getting_city = State()
-    getting_contact = State()
-    getting_details = State()
-
-
-# === Вспомогательные функции ===
-
-def service_inline_keyboard() -> InlineKeyboardMarkup:
-    """
-    Инлайн-меню с выбором услуги.
-    callback_data вида: svc:0, svc:1, ...
-    """
-    buttons = [
-        [InlineKeyboardButton(text=service, callback_data=f"svc:{idx}")]
-        for idx, service in enumerate(SERVICE_OPTIONS)
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+THANK_YOU_TEXT = (
+    "<b>Спасибо!</b> Заявка отправлена нашему специалисту.\n"
+    "Обычно отвечаем в рабочие часы в течение <b>10–30 минут</b>."
+)
 
 
-def save_lead_to_file(lead: dict) -> None:
-    """
-    Сохраняем одну заявку в файл LEADS_FILE в формате JSONL (1 строка = 1 JSON).
-    """
-    try:
-        with open(LEADS_FILE, "a", encoding="utf-8") as f:
-            json.dump(lead, f, ensure_ascii=False)
-            f.write("\n")
-    except Exception as e:
-        logging.exception("Не удалось сохранить заявку в файл: %r", e)
+# === Helpers ===
+
+def _is_blank(text: Optional[str]) -> bool:
+    return not text or not text.strip()
 
 
-def load_last_leads(limit: int = 10) -> list[dict]:
-    """
-    Читаем последние limit заявок из LEADS_FILE.
-    Если файла нет — возвращаем пустой список.
-    """
-    leads: list[dict] = []
-    try:
-        with open(LEADS_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    leads.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-    except FileNotFoundError:
-        return []
-
-    if not leads:
-        return []
-
-    return leads[-limit:]
-
-
-def format_leads_for_admin(leads: list[dict]) -> list[str]:
-    """
-    Формируем текст для /leads, разбивая на куски <= 4000 символов.
-    Возвращаем список строк, которые можно по очереди отправить.
-    """
-    parts = []
-    for i, lead in enumerate(leads, start=1):
-        created_at = lead.get("created_at", "")
-        service = lead.get("service", "")
-        name = lead.get("name", "")
-        city = lead.get("city", "")
-        contact = lead.get("contact", "")
-        details = lead.get("details", "")
-        tg_id = lead.get("tg_id", "")
-        username = lead.get("username", "")
-
-        line = (
-            f"{i}. {created_at}\n"
-            f"   Услуга: {service}\n"
-            f"   Имя: {name}\n"
-            f"   Город: {city}\n"
-            f"   Контакт: {contact}\n"
-            f"   Описание: {details}\n"
-            f"   TG ID: {tg_id}"
-        )
-        if username:
-            line += f" (@{username})"
-        parts.append(line)
-
-    chunks: list[str] = []
-    current = ""
-
-    for part in parts:
-        if not current:
-            current = part
-            continue
-        # +2 на два перевода строки между блоками
-        if len(current) + 2 + len(part) > 4000:
-            chunks.append(current)
-            current = part
-        else:
-            current += "\n\n" + part
-
-    if current:
-        chunks.append(current)
-
-    return chunks
-
-
-# === Инициализация ===
+# === Dispatcher ===
 
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
 
-# === Хендлеры ===
-
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
-    """
-    /start — начало диалога, показываем инлайн-меню с услугами.
-    """
+    """Reset state and show service selection menu."""
     await state.clear()
-    await message.answer(
-        "Привет! Я помогу оформить заявку на услуги:\n"
-        "• пригон авто в РФ\n"
-        "• тюнинг / доработку\n"
-        "• резину и расходники\n"
-        "• детейлинг / подготовку авто\n\n"
-        "Выберите нужный вариант кнопкой ниже:",
-        reply_markup=service_inline_keyboard(),
-    )
+    await message.answer(GREETING_TEXT, reply_markup=service_inline_keyboard())
     await state.set_state(LeadForm.choosing_service)
 
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext) -> None:
-    """
-    /cancel — сброс текущего сценария.
-    """
+    """Cancel the current dialog."""
     await state.clear()
     await message.answer(
-        "Окей, всё отменил. Чтобы начать заново — отправьте /start.",
+        "Сценарий сброшен. Когда будете готовы начать заново — нажмите /start.",
         reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@dp.message(LeadForm.choosing_service)
+async def remind_service_choice(message: Message) -> None:
+    """Ask the user to pick a service via inline buttons."""
+    await message.answer(
+        "Пожалуйста, выберите услугу кнопкой ниже, чтобы я понял ваш запрос.",
+        reply_markup=service_inline_keyboard(),
     )
 
 
 @dp.callback_query(LeadForm.choosing_service, F.data.startswith("svc:"))
 async def process_service_callback(callback: CallbackQuery, state: FSMContext) -> None:
-    """
-    Пользователь выбрал услугу из инлайн-меню.
-    """
+    """Handle service selection callback."""
     await callback.answer()
 
     data = callback.data or ""
-    _, idx_str = data.split(":", 1)
     try:
+        _, idx_str = data.split(":", 1)
         idx = int(idx_str)
-    except ValueError:
-        idx = 0
+    except (ValueError, IndexError):
+        idx = -1
 
     if not (0 <= idx < len(SERVICE_OPTIONS)):
         await callback.message.answer(
-            "Не удалось определить услугу. Попробуйте ещё раз: /start."
+            "Не удалось определить услугу. Пожалуйста, выберите вариант из списка.",
+            reply_markup=service_inline_keyboard(),
         )
-        await state.clear()
         return
 
     service = SERVICE_OPTIONS[idx]
     await state.update_data(service=service)
-
     await callback.message.answer(
-        f"Вы выбрали: <b>{service}</b>\n\n"
-        "Как к вам обращаться?",
+        SERVICE_CONFIRMED_TEXT.format(service=service),
         reply_markup=ReplyKeyboardRemove(),
     )
     await state.set_state(LeadForm.getting_name)
@@ -228,80 +132,58 @@ async def process_service_callback(callback: CallbackQuery, state: FSMContext) -
 
 @dp.message(LeadForm.getting_name)
 async def process_name(message: Message, state: FSMContext) -> None:
-    """
-    Имя клиента.
-    """
-    name = (message.text or "").strip()
-    await state.update_data(name=name)
+    """Ask for the client's name."""
+    if _is_blank(message.text):
+        await message.answer("Пожалуйста, укажите, как к вам обращаться.")
+        return
 
+    await state.update_data(name=message.text.strip())
     await message.answer("Из какого вы города?")
     await state.set_state(LeadForm.getting_city)
 
 
 @dp.message(LeadForm.getting_city)
 async def process_city(message: Message, state: FSMContext) -> None:
-    """
-    Город клиента.
-    """
-    city = (message.text or "").strip()
-    await state.update_data(city=city)
+    """Ask for the client's city."""
+    if _is_blank(message.text):
+        await message.answer("Напишите, пожалуйста, ваш город — это важно для логистики.")
+        return
 
-    await message.answer("Оставьте контакт для связи (телефон или @ник в Telegram).")
+    await state.update_data(city=message.text.strip())
+    await message.answer("Оставьте контакт для связи: телефон или @ник в Telegram.")
     await state.set_state(LeadForm.getting_contact)
 
 
 @dp.message(LeadForm.getting_contact)
 async def process_contact(message: Message, state: FSMContext) -> None:
-    """
-    Контакт клиента.
-    """
-    contact = (message.text or "").strip()
-    await state.update_data(contact=contact)
+    """Ask for the preferred contact method."""
+    if _is_blank(message.text):
+        await message.answer("Нужен контакт, чтобы связаться: номер телефона или @ник в Telegram.")
+        return
 
+    await state.update_data(contact=message.text.strip())
     data = await state.get_data()
-    service = data.get("service", "")
-
-    # Уточняющий вопрос по услуге
-    if service == SERVICE_OPTIONS[0]:
-        question = (
-            "Опишите, какой автомобиль вы хотите: "
-            "марка/модель, год, ориентировочный бюджет, важные опции."
-        )
-    elif service == SERVICE_OPTIONS[1]:
-        question = (
-            "Кратко опишите, что хотите доработать по тюнингу и на каком авто "
-            "(диски, обвес, оптика, салон и т.п.)."
-        )
-    elif service == SERVICE_OPTIONS[2]:
-        question = (
-            "Напишите, какая резина или какие расходники нужны и для какого авто. "
-            "Если важны бренды — укажите их."
-        )
-    elif service == SERVICE_OPTIONS[3]:
-        question = (
-            "Расскажите, что нужно по детейлингу (химчистка, полировка, "
-            "защитные покрытия и т.п.) и к какому сроку."
-        )
-    else:  # "Просто консультация"
-        question = "Напишите, пожалуйста, ваш вопрос или задачу в свободной форме."
-
+    service = data.get("service", SERVICE_OPTIONS[0])
+    question = DETAIL_QUESTIONS.get(
+        service,
+        "Опишите ваш запрос подробнее, чтобы мы подготовили точный ответ.",
+    )
     await message.answer(question)
     await state.set_state(LeadForm.getting_details)
 
 
 @dp.message(LeadForm.getting_details)
 async def process_details(message: Message, state: FSMContext) -> None:
-    """
-    Финальное описание задачи + сохранение и отправка заявки.
-    """
-    details = (message.text or "").strip()
-    await state.update_data(details=details)
+    """Collect details, save lead, and send summaries."""
+    if _is_blank(message.text):
+        await message.answer("Добавьте, пожалуйста, детали запроса, чтобы мы быстро помогли.")
+        return
 
+    await state.update_data(details=message.text.strip())
     data = await state.get_data()
-    created_at = datetime.now().isoformat(sep=" ", timespec="seconds")
 
     lead = {
-        "created_at": created_at,
+        "created_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
         "service": data.get("service"),
         "name": data.get("name"),
         "city": data.get("city"),
@@ -311,57 +193,31 @@ async def process_details(message: Message, state: FSMContext) -> None:
         "username": message.from_user.username if message.from_user else None,
     }
 
-    # Сохраняем в файл
-    save_lead_to_file(lead)
+    save_lead_to_file(lead, settings.leads_file)
+    summary = format_lead_summary(lead)
 
-    # Формируем сводку для пользователя/админа
-    text_lines = [
-        "Новая заявка:",
-        f"Время: {lead['created_at']}",
-        f"Услуга: {lead['service']}",
-        f"Имя: {lead['name']}",
-        f"Город: {lead['city']}",
-        f"Контакт: {lead['contact']}",
-        "",
-        "Описание запроса:",
-        lead["details"],
-        "",
-        f"Telegram ID: {lead['tg_id']}",
-    ]
-    if lead["username"]:
-        text_lines.append(f"Username: @{lead['username']}")
-
-    summary = "\n".join(line for line in text_lines if line)
-
-    # Отправляем сводку пользователю
     await message.answer(
-        "Спасибо! Я записал вашу заявку. Ниже — сводка:\n\n" + summary
+        f"{summary}\n\n{THANK_YOU_TEXT}",
     )
 
-    # Отправляем сводку админу (если указан ADMIN_CHAT_ID)
-    if ADMIN_CHAT_ID:
+    if settings.admin_chat_id:
         try:
-            await message.bot.send_message(chat_id=ADMIN_CHAT_ID, text=summary)
-        except Exception as e:
-            logging.exception("Не удалось отправить заявку админу: %r", e)
+            await message.bot.send_message(settings.admin_chat_id, summary)
+        except Exception:
+            logging.exception("Не удалось отправить заявку админу")
 
-    # Сбрасываем состояние
     await state.clear()
-    await message.answer(
-        "Если захотите оформить ещё одну заявку — отправьте /start."
-    )
+    await message.answer("Если захотите оформить ещё одну заявку — нажмите /start.")
 
 
 @dp.message(Command("leads"))
 async def cmd_leads(message: Message) -> None:
-    """
-    /leads — показывает админу последние заявки из файла.
-    """
-    if not ADMIN_CHAT_ID or message.from_user.id != ADMIN_CHAT_ID:
-        await message.answer("Эта команда доступна только администратору.")
+    """Show last leads to admin."""
+    if not settings.admin_chat_id or message.from_user.id != settings.admin_chat_id:
+        await message.answer("Команда доступна только администратору.")
         return
 
-    leads = load_last_leads(limit=10)
+    leads = load_last_leads(settings.leads_file, limit=10)
     if not leads:
         await message.answer("Заявок пока нет.")
         return
@@ -372,13 +228,16 @@ async def cmd_leads(message: Message) -> None:
         await message.answer(chunk)
 
 
-# === Точка входа ===
-
 async def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    """Entrypoint for running the bot."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    logging.info("Starting bot")
 
     bot = Bot(
-        token=BOT_TOKEN,
+        token=settings.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
 

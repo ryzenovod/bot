@@ -15,7 +15,13 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
 
 from config import Settings
-from keyboards import SERVICE_OPTIONS, service_inline_keyboard
+from keyboards import (
+    BACK_TO_SERVICES,
+    CANCEL_FLOW,
+    SERVICE_OPTIONS,
+    navigation_inline_keyboard,
+    service_inline_keyboard,
+)
 from leads import format_lead_summary, format_leads_for_admin, load_last_leads, save_lead_to_file
 from states import LeadForm
 
@@ -102,9 +108,32 @@ async def remind_service_choice(message: Message) -> None:
     )
 
 
-@dp.callback_query(LeadForm.choosing_service, F.data.startswith("svc:"))
+@dp.callback_query(F.data == BACK_TO_SERVICES)
+async def navigate_back(callback: CallbackQuery, state: FSMContext) -> None:
+    """Return the user to the service menu from any state."""
+    await callback.answer("Меню услуг")
+    await state.clear()
+    await callback.message.answer(
+        "Давайте подберём услугу заново. Что вас интересует?",
+        reply_markup=service_inline_keyboard(),
+    )
+    await state.set_state(LeadForm.choosing_service)
+
+
+@dp.callback_query(F.data == CANCEL_FLOW)
+async def navigate_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    """Stop the dialog via inline navigation."""
+    await callback.answer("Диалог остановлен")
+    await state.clear()
+    await callback.message.answer(
+        "Сценарий остановлен. Когда захотите — нажмите /start, чтобы начать заново.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@dp.callback_query(F.data.startswith("svc:"))
 async def process_service_callback(callback: CallbackQuery, state: FSMContext) -> None:
-    """Handle service selection callback."""
+    """Handle service selection callback from any state."""
     await callback.answer()
 
     data = callback.data or ""
@@ -122,10 +151,11 @@ async def process_service_callback(callback: CallbackQuery, state: FSMContext) -
         return
 
     service = SERVICE_OPTIONS[idx]
+    await state.clear()
     await state.update_data(service=service)
     await callback.message.answer(
         SERVICE_CONFIRMED_TEXT.format(service=service),
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=navigation_inline_keyboard(),
     )
     await state.set_state(LeadForm.getting_name)
 
@@ -134,11 +164,14 @@ async def process_service_callback(callback: CallbackQuery, state: FSMContext) -
 async def process_name(message: Message, state: FSMContext) -> None:
     """Ask for the client's name."""
     if _is_blank(message.text):
-        await message.answer("Пожалуйста, укажите, как к вам обращаться.")
+        await message.answer(
+            "Пожалуйста, укажите, как к вам обращаться.",
+            reply_markup=navigation_inline_keyboard(),
+        )
         return
 
     await state.update_data(name=message.text.strip())
-    await message.answer("Из какого вы города?")
+    await message.answer("Из какого вы города?", reply_markup=navigation_inline_keyboard())
     await state.set_state(LeadForm.getting_city)
 
 
@@ -146,11 +179,17 @@ async def process_name(message: Message, state: FSMContext) -> None:
 async def process_city(message: Message, state: FSMContext) -> None:
     """Ask for the client's city."""
     if _is_blank(message.text):
-        await message.answer("Напишите, пожалуйста, ваш город — это важно для логистики.")
+        await message.answer(
+            "Напишите, пожалуйста, ваш город — это важно для логистики.",
+            reply_markup=navigation_inline_keyboard(),
+        )
         return
 
     await state.update_data(city=message.text.strip())
-    await message.answer("Оставьте контакт для связи: телефон или @ник в Telegram.")
+    await message.answer(
+        "Оставьте контакт для связи: телефон или @ник в Telegram.",
+        reply_markup=navigation_inline_keyboard(),
+    )
     await state.set_state(LeadForm.getting_contact)
 
 
@@ -158,17 +197,21 @@ async def process_city(message: Message, state: FSMContext) -> None:
 async def process_contact(message: Message, state: FSMContext) -> None:
     """Ask for the preferred contact method."""
     if _is_blank(message.text):
-        await message.answer("Нужен контакт, чтобы связаться: номер телефона или @ник в Telegram.")
+        await message.answer(
+            "Нужен контакт, чтобы связаться: номер телефона или @ник в Telegram.",
+            reply_markup=navigation_inline_keyboard(),
+        )
         return
 
     await state.update_data(contact=message.text.strip())
     data = await state.get_data()
     service = data.get("service", SERVICE_OPTIONS[0])
-    question = DETAIL_QUESTIONS.get(
+    raw_question = DETAIL_QUESTIONS.get(
         service,
         "Опишите ваш запрос подробнее, чтобы мы подготовили точный ответ.",
     )
-    await message.answer(question)
+    question = "\n".join(raw_question) if isinstance(raw_question, (list, tuple)) else str(raw_question)
+    await message.answer(question, reply_markup=navigation_inline_keyboard())
     await state.set_state(LeadForm.getting_details)
 
 
@@ -176,7 +219,10 @@ async def process_contact(message: Message, state: FSMContext) -> None:
 async def process_details(message: Message, state: FSMContext) -> None:
     """Collect details, save lead, and send summaries."""
     if _is_blank(message.text):
-        await message.answer("Добавьте, пожалуйста, детали запроса, чтобы мы быстро помогли.")
+        await message.answer(
+            "Добавьте, пожалуйста, детали запроса, чтобы мы быстро помогли.",
+            reply_markup=navigation_inline_keyboard(),
+        )
         return
 
     await state.update_data(details=message.text.strip())

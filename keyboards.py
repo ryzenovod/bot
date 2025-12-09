@@ -9,6 +9,9 @@ SERVICE_OPTIONS = [
     "💬 Просто консультация",
 ]
 
+BACK_TO_SERVICES = "nav:services"
+CANCEL_FLOW = "nav:cancel"
+
 
 def service_inline_keyboard() -> InlineKeyboardMarkup:
     """Create inline keyboard for service selection."""
@@ -17,3 +20,21 @@ def service_inline_keyboard() -> InlineKeyboardMarkup:
         for idx, service in enumerate(SERVICE_OPTIONS)
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def navigation_inline_keyboard() -> InlineKeyboardMarkup:
+    """Inline keyboard for returning to the service menu or cancelling."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="↩️ Выбрать другую услугу", callback_data=BACK_TO_SERVICES
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⏹ Завершить диалог", callback_data=CANCEL_FLOW
+                )
+            ],
+        ]
+    )
